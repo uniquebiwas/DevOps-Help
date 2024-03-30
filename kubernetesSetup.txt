@@ -1,0 +1,383 @@
+Setup Kubernetes Cluster with Kubeadm, Containerd, Calico and MetalLB 
+https://nvtienanh.info/blog/cai-dat-kubernetes-cluster-tren-ubuntu-server-22-04
+https://medium.com/@priyantha.getc/step-by-step-guide-to-creating-a-kubernetes-cluster-on-ubuntu-22-04-using-containerd-runtime-0ead53a8d273
+
+→ 
+(M/W)
+sudo apt update
+sudo apt upgrade -y
+
+—-----
+Master node
+sudo netstat -tulpn | grep "6443\|2379\|2380\|10250\|10259\|10257"
+
+Woker Node
+
+sudo netstat -tulpn | grep "10250"
+
+
+—---------
+Swap off ( M/W)
+
+sudo swapoff -a
+sudo sed -i.bak -r 's/(.+ swap .+)/#\1/' /etc/fstab
+free -m
+
+cat /etc/fstab | grep swap
+
+—-------
+Configure required kernel modules / CP-W
+
+sudo vim /etc/modules-load.d/k8s.conf
+
+ADD THIS CONTAINTS
+
+overlay
+br_netfilter
+
+RUN this 
+
+sudo modprobe overlay \
+ sudo modprobe br_netfilter
+
+CHECK
+lsmod | grep "overlay\|br_netfilter"
+
+Configure network parameters / CP-W
+
+sudo vim /etc/sysctl.d/k8s.conf
+
+Add below content, save and close the file
+
+net.bridge.bridge-nf-call-ip6tables = 1
+net.bridge.bridge-nf-call-iptables = 1
+net.ipv4.ip_forward = 1
+
+Apply newly added network params
+sudo sysctl --system
+
+
+
+
+
+
+Install containerd run time
+sudo apt install -y curl gnupg2 software-properties-common apt-transport-https ca-certificates
+sudo curl -fsSL https://download.docker.com/linux/ubuntu/gpg | sudo gpg --dearmour -o /etc/apt/trusted.gpg.d/docker.gpg
+sudo add-apt-repository "deb [arch=amd64] https://download.docker.com/linux/ubuntu $(lsb_release -cs) stable"
+sudo apt update
+sudo apt install -y containerd.io
+
+
+Once installed, we add the containerd configuration.
+
+containerd config default | sudo tee /etc/containerd/config.toml >/dev/null 2>&1
+sudo sed -i 's/SystemdCgroup \= false/SystemdCgroup \= true/g' /etc/containerd/config.toml
+sudo systemctl restart containerd
+sudo systemctl enable containerd
+
+
+Install Kubernetes Tools & containerd Runtime
+
+curl -s https://packages.cloud.google.com/apt/doc/apt-key.gpg | sudo apt-key add -
+sudo apt-add-repository "deb http://apt.kubernetes.io/ kubernetes-xenial main"
+sudo apt update
+sudo apt install -y kubelet kubeadm kubectl
+sudo apt-mark hold kubelet kubeadm kubectl
+
+
+
+
+(if not present) Reference 2 start from here 
+sudo mkdir -p /etc/containerd
+sudo containerd config default|sudo tee /etc/containerd/config.toml
+
+Edit config.toml
+[plugins."io.containerd.grpc.v1.cri".containerd.runtimes.runc]
+ runtime_type = "io.containerd.runc.v2"  # <- note this, this line might have been missed
+ [plugins."io.containerd.grpc.v1.cri".containerd.runtimes.runc.options]
+   SystemdCgroup = true # <- note this, this could be set as false in the default configuration, please make it true
+​​
+Restart 
+sudo systemctl restart containerd
+sudo systemctl enable containerd
+systemctl status containerd
+
+Setup crictl for inspecting containers / CP-W
+sudo crictl ps
+sudo apt install cri-tools
+sudo vim /etc/crictl.yaml
+Paste below content, save and exit
+runtime-endpoint: unix:///run/containerd/containerd.sock
+image-endpoint: unix:///run/containerd/containerd.sock
+timeout: 2
+debug: true # <- if you don't want to see debug info you can set this to false
+pull-image-on-create: false
+Enable kubelet service / CW-P
+sudo systemctl enable kubelet
+Initializing Control-Plane Node
+sudo crictl images
+sudo kubeadm config images pull --cri-socket unix:///var/run/containerd/containerd.sock
+sudo crictl images
+sudo kubeadm init \
+ --pod-network-cidr=10.244.0.0/16 \
+ --cri-socket unix:///var/run/containerd/containerd.sock \
+ --v=5
+
+
+mkdir -p $HOME/.kube
+sudo cp -i /etc/kubernetes/admin.conf $HOME/.kube/config
+sudo chown $(id -u):$(id -g) $HOME/.kube/config
+
+kubectl get nodes
+
+Add network add-on (calico) / CP 
+
+kubectl create -f https://raw.githubusercontent.com/projectcalico/calico/v3.27.2/manifests/tigera-operator.yaml
+
+curl https://raw.githubusercontent.com/projectcalico/calico/v3.27.2/manifests/custom-resources.yaml -O
+
+Check custom-resources.yaml  and edit IP CIDR (of CNI calicoctl get ippools)
+
+kubectl create -f custom-resources.yaml (need to edit/ change pod CIDR)
+
+
+Check pods
+
+Loadbalancer (metallb)
+
+Note: check helm if not installed 
+curl -fsSL -o get_helm.sh https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3
+chmod 700 get_helm.sh
+./get_helm.sh
+Install Metallb
+( Creat namespace metallb-system)
+
+helm repo add metallb https://metallb.github.io/metallb
+helm install metallb metallb/metallb -n <namespace name>
+
+
+
+
+IP-POOL
+
+apiVersion: metallb.io/v1beta1
+kind: IPAddressPool
+metadata:
+  name: first-pool
+  namespace: metallb-system
+spec:
+  addresses:
+  - 10.244.0.1-10.244.0.100
+
+L2 Adv
+
+apiVersion: metallb.io/v1beta1
+kind: L2Advertisement
+metadata:
+  name: example
+  namespace: metallb-system
+spec:
+  ipAddressPools:
+  - first-pool
+  nodeSelectors:
+  - matchLabels:
+      kubernetes.io/hostname: NodeA
+  - matchLabels:
+      kubernetes.io/hostname: NodeB
+
+
+
+
+
+Remove Worker node (if needed)
+
+https://monowar-mukul.medium.com/kubernetes-remove-worker-node-from-the-cluster-and-completely-uninstall-af41e00c1244
+
+Kubernetes Metrics Server Setup 
+Appy this manifest to master node
+kubectl apply -f https://github.com/kubernetes-sigs/metrics-server/releases/latest/download/components.yaml
+Next change config file on all nodes at this: path
+/var/lib/kubelet/config.yaml
+Add  manually, serverTLSBootstrap: true
+
+
+Next, 
+Restart kubelet
+systemctl restart kubelet
+Then approve certificate
+
+
+
+
+
+Check if no route to host (worker to master)
+
+strace -eopenat kubectl version
+
+
+Setup Nginx Proxy Manager (CT)and Jump Host.
+
+Jump Host (VM)
+
+: pritunl (VM)VPN
+
+
+
+
+Vpn script
+
+
+#!/bin/bash
+sudo tee /etc/apt/sources.list.d/pritunl.list << EOF
+deb http://repo.pritunl.com/stable/apt jammy main
+EOF
+
+# Import signing key from keyserver
+sudo apt-key adv --keyserver hkp://keyserver.ubuntu.com --recv 7568D9BB55FF9E5287D586017AE645C0CF8E292A
+# Alternative import from download if keyserver offline
+curl https://raw.githubusercontent.com/pritunl/pgp/master/pritunl_repo_pub.asc | sudo apt-key add -
+
+sudo tee /etc/apt/sources.list.d/mongodb-org-6.0.list << EOF
+deb https://repo.mongodb.org/apt/ubuntu jammy/mongodb-org/6.0 multiverse
+EOF
+
+wget -qO - https://www.mongodb.org/static/pgp/server-6.0.asc | sudo apt-key add -
+
+sudo apt update
+sudo apt --assume-yes upgrade
+
+# WireGuard server support
+sudo apt -y install wireguard wireguard-tools
+
+sudo ufw disable
+
+sudo apt -y install pritunl mongodb-org
+sudo systemctl enable mongod pritunl
+sudo systemctl start mongod pritunl
+
+
+Nginx Proxy Manager (Docker-Compose)
+
+version: "3"
+services:
+  app:
+    image: 'jc21/nginx-proxy-manager:latest'
+    restart: unless-stopped
+    ports:
+      # These ports are in format <host-port>:<container-port>
+      - '80:80' # Public HTTP Port
+      - '443:443' # Public HTTPS Port
+      - '81:81' # Admin Web Port
+      # Add any other Stream port you want to expose
+      # - '21:21' # FTP
+    environment:
+      DB_MYSQL_HOST: "db"
+      DB_MYSQL_PORT: 3306
+      DB_MYSQL_USER: "npm"
+      DB_MYSQL_PASSWORD: "npm"
+      DB_MYSQL_NAME: "npm"
+      # Uncomment this if IPv6 is not enabled on your host
+      # DISABLE_IPV6: 'true'
+    volumes:
+      - ./data:/data
+      - ./letsencrypt:/etc/letsencrypt
+    depends_on:
+      - db
+
+  db:
+    image: 'jc21/mariadb-aria:latest'
+    restart: unless-stopped
+    environment:
+      MYSQL_ROOT_PASSWORD: 'npm'
+      MYSQL_DATABASE: 'npm'
+      MYSQL_USER: 'npm'
+      MYSQL_PASSWORD: 'npm'
+    volumes:
+      - ./data/mysql:/var/lib/mysql
+
+
+
+
+
+External Services
+
+Minio (VM) - (3 node)
+Mysql (VM)- 8gb, 4core, 
+Kafka and Zookeeper(  Helm)  
+Redis ( helm)
+Elasticdb ( helm)
+
+
+Multi-Node Minio
+
+https://min.io/docs/minio/linux/operations/install-deploy-manage/deploy-minio-multi-node-multi-drive.html#minio-mnmd
+
+https://sysadmins.co.za/setup-a-4-node-distributed-minio-cluster/
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+Redis ( https://medium.com/@thanawitsupinnapong/setting-up-redis-in-kubernetes-with-helm-and-manual-persistent-volume-f1d52fa1919f)
+ 
+{create storage class first}
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: standard
+provisioner: kubernetes.io/no-provisioner
+volumeBindingMode: WaitForFirstConsumer
+
+Change storage class to default
+kubectl patch storageclass standard -p '{"metadata": {"annotations":{"storageclass.kubernetes.io/is-default-class":"true"}}}'
+
+
+
+
+
+
+
+
+
+
+
+
+
+{create pv for both master and replica }
+
+apiVersion: v1
+kind: PersistentVolume
+metadata:
+  name: my-pv-2
+spec:
+  capacity:
+    storage: 10Gi
+  volumeMode: Filesystem
+  accessModes:
+    - ReadWriteOnce
+  persistentVolumeReclaimPolicy: Retain
+  storageClassName: standard
+  hostPath:
+    path: /root/data
+
+helm install redis oci://registry-1.docker.io/bitnamicharts/redis --set volumePermissions.enabled=true --set networkPolicy.enabled=true -f values.yaml
+
+
+
+
+
+
+
+
+
