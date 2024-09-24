@@ -1,0 +1,40 @@
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: biwas-ingress
+  namespace: biwas  
+  annotations:
+    nginx.ingress.kubernetes.io/rewrite-target: /
+    nginx.ingress.kubernetes.io/ssl-redirect: "true"  # from http to https
+    cert-manager.io/cluster-issuer: "letsencrypt-prod"  
+spec:
+  tls:
+  - hosts:
+    - biwaspudasaini.com.np
+    - app.biwaspudasaini.com.np
+    secretName: my-cert  # The TLS certificate name created from cert-manager
+
+  rules:
+  # Routing for the portfolio
+  - host: biwaspudasaini.com.np
+    http:
+      paths:
+      - path: /
+        pathType: Prefix
+        backend:
+          service:
+            name: portfolio-service  #  portfolio service name
+            port:
+              number: 80             
+
+  # Routing for the Django app
+  - host: app.biwaspudasaini.com.np
+    http:
+      paths:
+      - path: /
+        pathType: Prefix
+        backend:
+          service:
+            name: django-app-service  #  Django app service name
+            port:
+              number: 8000            
