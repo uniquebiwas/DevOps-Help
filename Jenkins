@@ -1,0 +1,122 @@
+pipeline {
+    agent any
+
+    environment {
+        DOCKER_IMAGE = "dockerusername/appname"
+        TAG = "${GIT_TAG_NAME}" // extracted below
+        TRIVY_CMD = "/usr/local/bin/trivy" // adjust path as needed
+        KUBECONFIG = credentials('kubeconfig') // Jenkins credentials ID for kubeconfig
+        DOCKER_CREDENTIALS = credentials('dockerhub-creds') // Jenkins DockerHub ID
+        SLACK_WEBHOOK_URL = credentials('slack-webhook') // Jenkins secret text
+        SONAR_TOKEN = credentials('sonarqube-token')
+    }
+
+    triggers {
+        // Trigger only on new tags
+        pollSCM('@hourly') // optional
+    }
+
+    options {
+        skipStagesAfterUnstable()
+        timestamps()
+    }
+
+    stages {
+
+        stage('Tag Verification') {
+            when {
+                expression {
+                    return env.GIT_BRANCH?.startsWith("refs/tags/")
+                }
+            }
+            steps {
+                script {
+                    env.GIT_TAG_NAME = sh(script: "echo ${GIT_BRANCH} | sed 's|refs/tags/||'", returnStdout: true).trim()
+                }
+                echo "Triggered by tag: ${env.GIT_TAG_NAME}"
+            }
+        }
+
+        stage('Checkout Code') {
+            steps {
+                git branch: "${GIT_TAG_NAME}", credentialsId: 'git-creds', url: 'https://github.com/repo/appname.git'
+            }
+        }
+
+        stage('Code Quality Check') {
+            steps {
+                withSonarQubeEnv('SonarQube') {
+                    sh """
+                        sonar-scanner \
+                        -Dsonar.projectKey=appname \
+                        -Dsonar.sources=. \
+                        -Dsonar.host.url=${SONAR_HOST_URL} \
+                        -Dsonar.login=${SONAR_TOKEN}
+                    """
+                }
+            }
+        }
+
+        stage('Build Docker Image') {
+            steps {
+                sh "docker build -t ${DOCKER_IMAGE}:${TAG} ."
+            }
+        }
+
+        stage('Scan Docker Image with Trivy') {
+            steps {
+                sh "${TRIVY_CMD} image --exit-code 1 --severity HIGH,CRITICAL ${DOCKER_IMAGE}:${TAG}"
+            }
+        }
+
+        stage('Push Docker Image') {
+            steps {
+                withCredentials([usernamePassword(credentialsId: 'dockerhub-creds', usernameVariable: 'DOCKER_USER', passwordVariable: 'DOCKER_PASS')]) {
+                    sh """
+                        echo "$DOCKER_PASS" | docker login -u "$DOCKER_USER" --password-stdin
+                        docker push ${DOCKER_IMAGE}:${TAG}
+                    """
+                }
+            }
+        }
+
+        stage('Deploy to Kubernetes') {
+            steps {
+                sh """
+                    kubectl config use-context your-context-name
+                    kubectl set image deployment/your-deployment your-container=${DOCKER_IMAGE}:${TAG} --namespace=your-namespace
+                    kubectl rollout status deployment/your-deployment --namespace=your-namespace
+                """
+            }
+        }
+
+        stage('Post Deployment Notification') {
+            steps {
+                script {
+                    def msg = "✅ Deployment successful for *${DOCKER_IMAGE}:${TAG}*"
+                    slackSend(color: '#36a64f', message: msg, webhookUrl: "${SLACK_WEBHOOK_URL}")
+                }
+
+                emailext (
+                    subject: "✅ Deployment Success - ${TAG}",
+                    body: "The deployment of ${DOCKER_IMAGE}:${TAG} to production was successful.",
+                    to: "your-team@example.com"
+                )
+            }
+        }
+    }
+
+    post {
+        failure {
+            script {
+                slackSend(color: 'danger', message: "❌ Deployment failed for *${DOCKER_IMAGE}:${TAG}*", webhookUrl: "${SLACK_WEBHOOK_URL}")
+            }
+
+            emailext (
+                subject: "❌ Deployment Failed - ${TAG}",
+                body: "The deployment of ${DOCKER_IMAGE}:${TAG} failed. Please check the Jenkins logs.",
+                to: "your-team@example.com"
+            )
+        }
+    }
+}
