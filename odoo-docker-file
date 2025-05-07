@@ -1,0 +1,41 @@
+FROM odoo:16.0
+
+
+# Set the working directory to /opt/odoo
+WORKDIR /opt/odoo
+
+USER root
+
+# if zk_attendence module?
+# RUN apt-get update && apt-get install -y iputils-ping && apt-get clean
+
+
+
+RUN apt-get update && \
+    apt-get install -y inotify-tools && \
+    apt-get clean && \
+    rm -rf /var/lib/apt/lists/*
+
+
+    
+# Install additional dependencies (e.g., Python packages)
+COPY requirements.txt /opt/odoo/requirements.txt
+RUN pip install --no-cache-dir -r /opt/odoo/requirements.txt
+
+COPY ./web-portal/ /mnt/extra-addons/
+
+# Copy the Odoo configuration file
+COPY ./odoo_config/odoo.conf /etc/odoo/odoo.conf
+
+# Add a script for upgrading a specific module
+COPY watch_addons_update.sh /usr/local/bin/watch_addons_update.sh
+RUN chmod +x /usr/local/bin/watch_addons_update.sh
+
+# Switch back to the odoo user
+USER odoo
+# Expose Odoo's default HTTP port
+# EXPOSE 8069
+# EXPOSE 8069 8000
+
+
+CMD ["sh", "-c", "/usr/local/bin/watch_addons_update.sh && odoo --config /etc/odoo.conf"]
