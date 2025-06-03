@@ -1,0 +1,151 @@
+pipeline {
+  agent any
+
+  environment {
+    PATH = "/usr/local/bin:${env.PATH}"
+    SONAR_HOST_URL = 'http://sonarurl'
+    SONAR_PROJECT_KEY = 'rmjob-project'
+    SONAR_TOKEN = credentials('SONAR_TOKEN')
+  }
+
+  stages {
+    stage('Checkout') {
+      steps {
+        git branch: 'main', url: 'https://github.com/uniquebiwas/Remote-Job-Finder.git'
+      }
+    }
+
+    stage('SonarQube Analysis') {
+      steps {
+        withSonarQubeEnv('SonarQube') {
+          withEnv(["PATH+SONAR=${tool 'SonarQube Scanner'}/bin"]) {
+            sh '''
+              set -e
+              sonar-scanner -Dsonar.projectKey=${SONAR_PROJECT_KEY} -Dsonar.sources=.
+            '''
+          }
+        }
+      }
+    }
+
+    stage('Wait for Quality Gate') {
+      steps {
+        sleep time: 20, unit: 'SECONDS'
+      }
+    }
+
+    stage('Fetch Quality Gate Status and Project Metrics') {
+      steps {
+        script {
+          def analysisId = ''
+          for (int i = 0; i < 10; i++) {
+            analysisId = sh(
+              script: """
+                curl -fsS -u ${SONAR_TOKEN}: \
+                  '${SONAR_HOST_URL}/api/project_analyses/search?project=${SONAR_PROJECT_KEY}' \
+                  | jq -r '.analyses[0].key'
+              """,
+              returnStdout: true
+            ).trim()
+
+            if (analysisId && analysisId != 'null') {
+              echo "✅ Found analysis ID: ${analysisId}"
+              break
+            } else {
+              echo "⏳ Attempt ${i+1}: Analysis ID not found. Retrying in 12s..."
+              sleep 12
+            }
+          }
+
+          if (!analysisId || analysisId == 'null') {
+            error '❌ Could not find Analysis ID after retries!'
+          }
+
+          // Fetch Quality Gate status
+          def statusJson = sh(
+            script: """
+              curl -fsS -u ${SONAR_TOKEN}: \
+                '${SONAR_HOST_URL}/api/qualitygates/project_status?analysisId=${analysisId}'
+            """,
+            returnStdout: true
+          )
+
+          def status = sh(
+            script: "echo '${statusJson}' | jq -r '.projectStatus.status'",
+            returnStdout: true
+          ).trim()
+
+          // Fetch component details
+          def componentJson = sh(
+            script: """
+              curl -fsS -u ${SONAR_TOKEN}: \
+                '${SONAR_HOST_URL}/api/components/show?component=${SONAR_PROJECT_KEY}'
+            """,
+            returnStdout: true
+          )
+
+          def componentInfo = readJSON text: componentJson
+          def projectName = componentInfo.component.name
+          def visibility = componentInfo.component.visibility
+          def language = componentInfo.component.language ?: 'Mixed'
+
+          // Fetch measures including issues count
+          def measuresJson = sh(
+            script: """
+              curl -fsS -u ${SONAR_TOKEN}: \
+                '${SONAR_HOST_URL}/api/measures/component?component=${SONAR_PROJECT_KEY}&metricKeys=security_rating,security_remediation_effort,reliability_rating,reliability_remediation_effort,sqale_rating,code_smells,bugs,vulnerabilities,security_hotspots,coverage,duplicated_lines_density,ncloc'
+            """,
+            returnStdout: true
+          )
+
+          def measures = readJSON text: measuresJson
+          def getMetricValue = { key ->
+            def metric = measures.component.measures.find { it.metric == key }
+            return metric ? metric.value : 'N/A'
+          }
+
+          // Get required metrics
+          def securityRating = getMetricValue('security_rating')
+          def reliabilityRating = getMetricValue('reliability_rating')
+          def maintainabilityRating = getMetricValue('sqale_rating')
+          def securityIssues = getMetricValue('vulnerabilities')
+          def reliabilityIssues = getMetricValue('bugs')
+          def maintainabilityIssues = getMetricValue('code_smells')
+          def hotspots = getMetricValue('security_hotspots')
+          def coverage = getMetricValue('coverage')
+          def duplications = getMetricValue('duplicated_lines_density')
+          def linesOfCode = getMetricValue('ncloc')
+
+          echo """
+          ========= 📊 Project Metrics Summary =========
+          📌 Project Name: ${projectName}
+          🌐 Visibility: ${visibility}
+          ✅ Quality Gate: ${status}
+          📈 Lines of Code: ${linesOfCode}
+          🌐 Language: ${language}
+
+          🔐 Security Issues: ${securityIssues}
+          🐛 Reliability Issues: ${reliabilityIssues}
+          🛠️ Maintainability Issues: ${maintainabilityIssues}
+          🔥 Security Hotspots: ${hotspots}
+
+          🟩 Ratings (for reference):
+          🔐 Security Rating: ${securityRating}
+          🐛 Reliability Rating: ${reliabilityRating}
+          🛠️ Maintainability Rating: ${maintainabilityRating}
+
+          📊 Coverage: ${coverage}%
+          🔁 Duplications: ${duplications}%
+          ============================================
+          """
+
+          if (status != 'OK') {
+            error '❌ Quality Gate failed!'
+          } else {
+            echo '✅ Quality Gate passed!'
+          }
+        }
+      }
+    }
+  }
+}
